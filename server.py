@@ -42,6 +42,20 @@ ALLOWED_LOG_ROOTS = ("/var/log",)
 MAX_LOG_LINES = 500
 
 
+def _is_within_allowed_roots(resolved: Path) -> bool:
+    """True if a fully-resolved path sits inside an allowed log root.
+
+    The roots are resolved too, so platforms where a root is itself a symlink
+    (macOS: /var -> /private/var) compare correctly. Both sides of a
+    containment check must be resolved or legitimate paths get rejected.
+    """
+    for root in ALLOWED_LOG_ROOTS:
+        root_resolved = Path(root).resolve()
+        if resolved == root_resolved or resolved.is_relative_to(root_resolved):
+            return True
+    return False
+
+
 class ResponseFormat(str, Enum):
     """Output format for tool responses."""
 
@@ -689,7 +703,7 @@ async def tail_log(params: LogInput) -> str:
         str: The matching log lines, or an actionable error message.
     """
     resolved = Path(params.path).resolve()
-    if not any(str(resolved).startswith(root + "/") or str(resolved) == root for root in ALLOWED_LOG_ROOTS):
+    if not _is_within_allowed_roots(resolved):
         return (
             f"Error: '{params.path}' resolves outside the allowed log roots "
             f"({', '.join(ALLOWED_LOG_ROOTS)}). This tool only reads system logs."
