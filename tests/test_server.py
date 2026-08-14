@@ -39,6 +39,28 @@ def _swap(total: int, percent: float) -> SimpleNamespace:
     return SimpleNamespace(total=total, used=int(total * percent / 100), percent=percent)
 
 
+def _fake_partitions(monkeypatch, specs) -> None:
+    """Patch disk_partitions/disk_usage from (mount, device, fstype, opts, pct)."""
+    parts = [
+        SimpleNamespace(mountpoint=m, device=d, fstype=f, opts=o)
+        for m, d, f, o, _ in specs
+    ]
+    percents = {m: p for m, _, _, _, p in specs}
+    total = 100 * 1024**3
+
+    monkeypatch.setattr(server.psutil, "disk_partitions", lambda all=False: parts)
+    monkeypatch.setattr(
+        server.psutil,
+        "disk_usage",
+        lambda mount: SimpleNamespace(
+            total=total,
+            used=int(total * percents[mount] / 100),
+            free=total - int(total * percents[mount] / 100),
+            percent=percents[mount],
+        ),
+    )
+
+
 @pytest.mark.asyncio
 async def test_cpu_status_json_shape():
     out = await get_cpu_status(sample_seconds=0.1, response_format=ResponseFormat.JSON)
@@ -80,6 +102,22 @@ async def test_disk_usage_bad_path_is_actionable():
     out = await get_disk_usage(path="/definitely/not/a/real/path")
     assert out.startswith("Error:")
     assert "get_disk_usage" in out  # suggests the fix
+
+
+@pytest.mark.asyncio
+async def test_disk_usage_does_not_warn_on_read_only_mounts(monkeypatch):
+    """A full squashfs snap mount is reported but not flagged."""
+    _fake_partitions(
+        monkeypatch,
+        [("/", "/dev/sda1", "ext4", "rw,relatime", 55.0),
+         ("/snap/core20/2015", "/dev/loop0", "squashfs", "ro,nodev,relatime", 100.0)],
+    )
+    data = json.loads(await get_disk_usage(response_format=ResponseFormat.JSON))
+    by_mount = {p["mountpoint"]: p for p in data["partitions"]}
+    assert by_mount["/snap/core20/2015"]["percent"] == 100.0
+    assert by_mount["/snap/core20/2015"]["read_only"] is True
+    assert by_mount["/snap/core20/2015"]["warning"] is False
+    assert data["warnings"] == 0
 
 
 @pytest.mark.asyncio
@@ -170,6 +208,42 @@ async def test_host_summary_prefers_exhaustion_over_swapping(monkeypatch):
     data = json.loads(await get_host_summary(response_format=ResponseFormat.JSON))
     assert "nearly exhausted" in data["assessment"]
     assert "swapping" not in data["assessment"]
+
+
+@pytest.mark.asyncio
+async def test_host_summary_ignores_full_read_only_mounts(monkeypatch):
+    """A permanently-full snap mount must not pin the assessment on.
+
+    Every Ubuntu host with snaps installed carries squashfs loop mounts at
+    100%, which would otherwise report "a disk is nearly full" forever.
+    """
+    monkeypatch.setattr(server.psutil, "cpu_percent", lambda interval=None: 5.0)
+    monkeypatch.setattr(server.psutil, "virtual_memory", lambda: _vm(percent=40.0))
+    monkeypatch.setattr(server.psutil, "swap_memory", lambda: _swap(total=0, percent=0.0))
+    _fake_partitions(
+        monkeypatch,
+        [("/", "/dev/sda1", "ext4", "rw,relatime", 45.0),
+         ("/snap/core20/2015", "/dev/loop0", "squashfs", "ro,nodev,relatime", 100.0)],
+    )
+    data = json.loads(await get_host_summary(response_format=ResponseFormat.JSON))
+    assert data["max_disk_percent"] == 45.0
+    assert data["assessment"] == "no immediate resource pressure detected"
+
+
+@pytest.mark.asyncio
+async def test_host_summary_still_flags_writable_full_disks(monkeypatch):
+    """The read-only exclusion must not mask a genuinely full writable disk."""
+    monkeypatch.setattr(server.psutil, "cpu_percent", lambda interval=None: 5.0)
+    monkeypatch.setattr(server.psutil, "virtual_memory", lambda: _vm(percent=40.0))
+    monkeypatch.setattr(server.psutil, "swap_memory", lambda: _swap(total=0, percent=0.0))
+    _fake_partitions(
+        monkeypatch,
+        [("/", "/dev/sda1", "ext4", "rw,relatime", 96.0),
+         ("/snap/core20/2015", "/dev/loop0", "squashfs", "ro,nodev,relatime", 100.0)],
+    )
+    data = json.loads(await get_host_summary(response_format=ResponseFormat.JSON))
+    assert data["max_disk_percent"] == 96.0
+    assert "a disk is nearly full" in data["assessment"]
 
 
 @pytest.mark.asyncio

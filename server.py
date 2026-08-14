@@ -78,6 +78,18 @@ class ResponseFormat(str, Enum):
     JSON = "json"
 
 
+def _is_read_only(part) -> bool:
+    """True if a partition is mounted read-only.
+
+    A read-only mount cannot be freed up, so its fullness is never the
+    actionable finding. This matters in practice: Linux hosts carry squashfs
+    snap mounts that sit at 100% by design, and macOS mounts the system
+    volume read-only. Either would otherwise pin a "disk nearly full"
+    assessment permanently on.
+    """
+    return "ro" in part.opts.split(",")
+
+
 def _gb(num_bytes: int) -> float:
     """Convert bytes to gigabytes, rounded for display."""
     return round(num_bytes / BYTES_IN_GB, 2)
@@ -233,8 +245,9 @@ def _disk_markdown(d: dict) -> str:
     lines = ["## Disk Usage"]
     for p in d["partitions"]:
         flag = " ⚠️ **WARNING**" if p["warning"] else ""
+        ro = " (read-only)" if p.get("read_only") else ""
         lines.append(
-            f"- `{p['mountpoint']}` ({p['device']}, {p['fstype']}): "
+            f"- `{p['mountpoint']}` ({p['device']}, {p['fstype']}){ro}: "
             f"{p['used_gb']} / {p['total_gb']} GB used ({p['percent']}%){flag}"
         )
     if d["warnings"]:
@@ -275,9 +288,12 @@ async def get_disk_usage(
 ) -> str:
     """Get disk usage per partition, flagging any above a warning threshold.
 
+    Read-only mounts are listed but never flagged, since space cannot be
+    reclaimed on them (Linux snap squashfs mounts sit at 100% by design).
+
     Returns:
         str: Markdown summary or JSON object with keys: partitions (list of
-        {mountpoint,device,fstype,total_gb,used_gb,percent,warning}),
+        {mountpoint,device,fstype,total_gb,used_gb,percent,read_only,warning}),
         warnings (count), warn_percent.
     """
     targets = []
@@ -287,13 +303,13 @@ async def get_disk_usage(
                 f"Error: path '{path}' does not exist. "
                 "Call get_disk_usage without a path to list available mount points."
             )
-        targets.append((path, path, "-"))
+        targets.append((path, path, "-", False))
     else:
         for part in psutil.disk_partitions(all=False):
-            targets.append((part.mountpoint, part.device, part.fstype))
+            targets.append((part.mountpoint, part.device, part.fstype, _is_read_only(part)))
 
     partitions = []
-    for mountpoint, device, fstype in targets:
+    for mountpoint, device, fstype, read_only in targets:
         try:
             usage = psutil.disk_usage(mountpoint)
         except PermissionError:
@@ -306,7 +322,10 @@ async def get_disk_usage(
                 "total_gb": _gb(usage.total),
                 "used_gb": _gb(usage.used),
                 "percent": usage.percent,
-                "warning": usage.percent >= warn_percent,
+                "read_only": read_only,
+                # Read-only mounts are listed for completeness but never
+                # warned on; there is no way to reclaim space on them.
+                "warning": usage.percent >= warn_percent and not read_only,
             }
         )
     payload = {
@@ -609,6 +628,8 @@ async def get_host_summary(
     swap = psutil.swap_memory()
     max_disk = 0.0
     for part in psutil.disk_partitions(all=False):
+        if _is_read_only(part):
+            continue
         try:
             max_disk = max(max_disk, psutil.disk_usage(part.mountpoint).percent)
         except PermissionError:
