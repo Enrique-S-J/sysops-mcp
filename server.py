@@ -16,12 +16,12 @@ import time
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Annotated, Optional
 
 import psutil
 from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import Field, StringConstraints
 
 mcp = MCPServer(
     name="sysops_mcp",
@@ -56,6 +56,15 @@ def _is_within_allowed_roots(resolved: Path) -> bool:
     return False
 
 
+# Tool parameters are declared individually rather than as a single Pydantic
+# model argument. The SDK maps one function parameter to one schema property,
+# so a lone model parameter would advertise every tool as taking a single
+# opaque object; declaring fields directly gives clients named arguments.
+StrippedStr = Annotated[str, StringConstraints(strip_whitespace=True)]
+
+FORMAT_DESC = "'markdown' for human-readable output, 'json' for structured data."
+
+
 class ResponseFormat(str, Enum):
     """Output format for tool responses."""
 
@@ -85,26 +94,6 @@ def _render(payload: dict, fmt: ResponseFormat, md_renderer) -> str:
 # ---------------------------------------------------------------------------
 
 
-class CpuInput(BaseModel):
-    """Input for get_cpu_status."""
-
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-    sample_seconds: float = Field(
-        default=1.0,
-        description="How long to sample CPU utilization (e.g. 1.0). Longer samples smooth spikes.",
-        ge=0.1,
-        le=10.0,
-    )
-    per_core: bool = Field(
-        default=False, description="Include per-core utilization breakdown."
-    )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
-        description="'markdown' for human-readable output, 'json' for structured data.",
-    )
-
-
 def _cpu_markdown(d: dict) -> str:
     lines = [
         "## CPU Status",
@@ -130,7 +119,23 @@ def _cpu_markdown(d: dict) -> str:
         openWorldHint=False,
     ),
 )
-async def get_cpu_status(params: CpuInput) -> str:
+async def get_cpu_status(
+    sample_seconds: Annotated[
+        float,
+        Field(
+            description="How long to sample CPU utilization (e.g. 1.0). "
+            "Longer samples smooth spikes.",
+            ge=0.1,
+            le=10.0,
+        ),
+    ] = 1.0,
+    per_core: Annotated[
+        bool, Field(description="Include per-core utilization breakdown.")
+    ] = False,
+    response_format: Annotated[ResponseFormat, Field(description=FORMAT_DESC)] = (
+        ResponseFormat.MARKDOWN
+    ),
+) -> str:
     """Get CPU utilization, core counts, and load averages.
 
     Samples CPU for `sample_seconds` and reports utilization percentage,
@@ -142,38 +147,27 @@ async def get_cpu_status(params: CpuInput) -> str:
         sample_seconds, physical_cores, logical_cores, load_avg
         {1min,5min,15min}, load_per_core_1min, per_core_percent (optional).
     """
-    percent = psutil.cpu_percent(interval=params.sample_seconds)
-    per_core = (
-        psutil.cpu_percent(interval=0.1, percpu=True) if params.per_core else None
+    percent = psutil.cpu_percent(interval=sample_seconds)
+    per_core_percent = (
+        psutil.cpu_percent(interval=0.1, percpu=True) if per_core else None
     )
     la1, la5, la15 = psutil.getloadavg()
     logical = psutil.cpu_count(logical=True) or 1
     payload = {
         "percent": percent,
-        "sample_seconds": params.sample_seconds,
+        "sample_seconds": sample_seconds,
         "physical_cores": psutil.cpu_count(logical=False),
         "logical_cores": logical,
         "load_avg": {"1min": round(la1, 2), "5min": round(la5, 2), "15min": round(la15, 2)},
         "load_per_core_1min": round(la1 / logical, 2),
-        "per_core_percent": per_core,
+        "per_core_percent": per_core_percent,
     }
-    return _render(payload, params.response_format, _cpu_markdown)
+    return _render(payload, response_format, _cpu_markdown)
 
 
 # ---------------------------------------------------------------------------
 # Memory
 # ---------------------------------------------------------------------------
-
-
-class MemoryInput(BaseModel):
-    """Input for get_memory_status."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
-        description="'markdown' for human-readable output, 'json' for structured data.",
-    )
 
 
 def _memory_markdown(d: dict) -> str:
@@ -198,7 +192,11 @@ def _memory_markdown(d: dict) -> str:
         openWorldHint=False,
     ),
 )
-async def get_memory_status(params: MemoryInput) -> str:
+async def get_memory_status(
+    response_format: Annotated[ResponseFormat, Field(description=FORMAT_DESC)] = (
+        ResponseFormat.MARKDOWN
+    ),
+) -> str:
     """Get RAM and swap utilization.
 
     Returns:
@@ -217,35 +215,12 @@ async def get_memory_status(params: MemoryInput) -> str:
         },
         "swap": {"total_gb": _gb(sw.total), "used_gb": _gb(sw.used), "percent": sw.percent},
     }
-    return _render(payload, params.response_format, _memory_markdown)
+    return _render(payload, response_format, _memory_markdown)
 
 
 # ---------------------------------------------------------------------------
 # Disk
 # ---------------------------------------------------------------------------
-
-
-class DiskInput(BaseModel):
-    """Input for get_disk_usage."""
-
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-    path: Optional[str] = Field(
-        default=None,
-        description="Specific mount point or path to inspect (e.g. '/', '/var'). "
-        "Omit to list all mounted partitions.",
-        max_length=4096,
-    )
-    warn_percent: float = Field(
-        default=85.0,
-        description="Usage percentage above which a partition is flagged as WARNING.",
-        ge=1.0,
-        le=100.0,
-    )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
-        description="'markdown' for human-readable output, 'json' for structured data.",
-    )
 
 
 def _disk_markdown(d: dict) -> str:
@@ -271,11 +246,28 @@ def _disk_markdown(d: dict) -> str:
         openWorldHint=False,
     ),
 )
-async def get_disk_usage(params: DiskInput) -> str:
+async def get_disk_usage(
+    path: Annotated[
+        Optional[StrippedStr],
+        Field(
+            description="Specific mount point or path to inspect (e.g. '/', '/var'). "
+            "Omit to list all mounted partitions.",
+            max_length=4096,
+        ),
+    ] = None,
+    warn_percent: Annotated[
+        float,
+        Field(
+            description="Usage percentage above which a partition is flagged as WARNING.",
+            ge=1.0,
+            le=100.0,
+        ),
+    ] = 85.0,
+    response_format: Annotated[ResponseFormat, Field(description=FORMAT_DESC)] = (
+        ResponseFormat.MARKDOWN
+    ),
+) -> str:
     """Get disk usage per partition, flagging any above a warning threshold.
-
-    Args:
-        params: Optional specific path; warning threshold percent; format.
 
     Returns:
         str: Markdown summary or JSON object with keys: partitions (list of
@@ -283,13 +275,13 @@ async def get_disk_usage(params: DiskInput) -> str:
         warnings (count), warn_percent.
     """
     targets = []
-    if params.path:
-        if not Path(params.path).exists():
+    if path:
+        if not Path(path).exists():
             return (
-                f"Error: path '{params.path}' does not exist. "
+                f"Error: path '{path}' does not exist. "
                 "Call get_disk_usage without a path to list available mount points."
             )
-        targets.append((params.path, params.path, "-"))
+        targets.append((path, path, "-"))
     else:
         for part in psutil.disk_partitions(all=False):
             targets.append((part.mountpoint, part.device, part.fstype))
@@ -308,15 +300,15 @@ async def get_disk_usage(params: DiskInput) -> str:
                 "total_gb": _gb(usage.total),
                 "used_gb": _gb(usage.used),
                 "percent": usage.percent,
-                "warning": usage.percent >= params.warn_percent,
+                "warning": usage.percent >= warn_percent,
             }
         )
     payload = {
         "partitions": partitions,
         "warnings": sum(1 for p in partitions if p["warning"]),
-        "warn_percent": params.warn_percent,
+        "warn_percent": warn_percent,
     }
-    return _render(payload, params.response_format, _disk_markdown)
+    return _render(payload, response_format, _disk_markdown)
 
 
 # ---------------------------------------------------------------------------
@@ -329,26 +321,6 @@ class SortBy(str, Enum):
 
     CPU = "cpu"
     MEMORY = "memory"
-
-
-class ProcessInput(BaseModel):
-    """Input for list_top_processes."""
-
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-    sort_by: SortBy = Field(
-        default=SortBy.CPU, description="Sort processes by 'cpu' or 'memory'."
-    )
-    limit: int = Field(default=10, description="Number of processes to return.", ge=1, le=50)
-    name_filter: Optional[str] = Field(
-        default=None,
-        description="Case-insensitive substring to filter process names (e.g. 'python').",
-        max_length=100,
-    )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
-        description="'markdown' for human-readable output, 'json' for structured data.",
-    )
 
 
 def _proc_markdown(d: dict) -> str:
@@ -376,12 +348,25 @@ def _proc_markdown(d: dict) -> str:
         openWorldHint=False,
     ),
 )
-async def list_top_processes(params: ProcessInput) -> str:
+async def list_top_processes(
+    sort_by: Annotated[
+        SortBy, Field(description="Sort processes by 'cpu' or 'memory'.")
+    ] = SortBy.CPU,
+    limit: Annotated[
+        int, Field(description="Number of processes to return.", ge=1, le=50)
+    ] = 10,
+    name_filter: Annotated[
+        Optional[StrippedStr],
+        Field(
+            description="Case-insensitive substring to filter process names (e.g. 'python').",
+            max_length=100,
+        ),
+    ] = None,
+    response_format: Annotated[ResponseFormat, Field(description=FORMAT_DESC)] = (
+        ResponseFormat.MARKDOWN
+    ),
+) -> str:
     """List the top processes by CPU or memory consumption.
-
-    Args:
-        params: Sort key ('cpu' or 'memory'), result limit, optional
-        case-insensitive name filter, and response format.
 
     Returns:
         str: Markdown table or JSON object with keys: count, sort_by,
@@ -391,7 +376,7 @@ async def list_top_processes(params: ProcessInput) -> str:
     for proc in psutil.process_iter(["pid", "name", "username", "memory_percent", "create_time"]):
         try:
             info = proc.info
-            if params.name_filter and params.name_filter.lower() not in (info["name"] or "").lower():
+            if name_filter and name_filter.lower() not in (info["name"] or "").lower():
                 continue
             info["cpu_percent"] = proc.cpu_percent(interval=None)
             procs.append(info)
@@ -408,7 +393,7 @@ async def list_top_processes(params: ProcessInput) -> str:
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
 
-    key = "cpu_percent" if params.sort_by == SortBy.CPU else "memory_percent"
+    key = "cpu_percent" if sort_by == SortBy.CPU else "memory_percent"
     procs.sort(key=lambda p: p.get(key) or 0, reverse=True)
     top = [
         {
@@ -419,30 +404,15 @@ async def list_top_processes(params: ProcessInput) -> str:
             "username": p.get("username") or "-",
             "started": _ts(p["create_time"]) if p.get("create_time") else "-",
         }
-        for p in procs[: params.limit]
+        for p in procs[:limit]
     ]
-    payload = {"count": len(top), "sort_by": params.sort_by.value, "processes": top}
-    return _render(payload, params.response_format, _proc_markdown)
+    payload = {"count": len(top), "sort_by": sort_by.value, "processes": top}
+    return _render(payload, response_format, _proc_markdown)
 
 
 # ---------------------------------------------------------------------------
 # Network
 # ---------------------------------------------------------------------------
-
-
-class NetworkInput(BaseModel):
-    """Input for get_network_status."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    include_connections: bool = Field(
-        default=False,
-        description="Include counts of TCP connections by state (ESTABLISHED, LISTEN, ...).",
-    )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
-        description="'markdown' for human-readable output, 'json' for structured data.",
-    )
 
 
 def _net_markdown(d: dict) -> str:
@@ -471,7 +441,18 @@ def _net_markdown(d: dict) -> str:
         openWorldHint=False,
     ),
 )
-async def get_network_status(params: NetworkInput) -> str:
+async def get_network_status(
+    include_connections: Annotated[
+        bool,
+        Field(
+            description="Include counts of TCP connections by state "
+            "(ESTABLISHED, LISTEN, ...).",
+        ),
+    ] = False,
+    response_format: Annotated[ResponseFormat, Field(description=FORMAT_DESC)] = (
+        ResponseFormat.MARKDOWN
+    ),
+) -> str:
     """Get network interfaces, their addresses, and I/O totals since boot.
 
     Optionally includes TCP connection counts grouped by state, which is
@@ -495,7 +476,7 @@ async def get_network_status(params: NetworkInput) -> str:
         "interfaces": interfaces,
         "io_totals": {"sent_gb": _gb(io.bytes_sent), "recv_gb": _gb(io.bytes_recv)},
     }
-    if params.include_connections:
+    if include_connections:
         states: dict[str, int] = {}
         try:
             for conn in psutil.net_connections(kind="tcp"):
@@ -505,29 +486,12 @@ async def get_network_status(params: NetworkInput) -> str:
             payload["tcp_states"] = {
                 "error": "Access denied. Re-run with elevated privileges to see connection states."
             }
-    return _render(payload, params.response_format, _net_markdown)
+    return _render(payload, response_format, _net_markdown)
 
 
 # ---------------------------------------------------------------------------
 # Port check
 # ---------------------------------------------------------------------------
-
-
-class PortCheckInput(BaseModel):
-    """Input for check_port."""
-
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-    host: str = Field(
-        default="127.0.0.1",
-        description="Hostname or IP to check (e.g. '127.0.0.1', 'db.internal').",
-        min_length=1,
-        max_length=253,
-    )
-    port: int = Field(..., description="TCP port number to test (e.g. 22, 443, 5432).", ge=1, le=65535)
-    timeout_seconds: float = Field(
-        default=3.0, description="Connection timeout in seconds.", ge=0.1, le=30.0
-    )
 
 
 @mcp.tool(
@@ -540,7 +504,23 @@ class PortCheckInput(BaseModel):
         openWorldHint=True,
     ),
 )
-async def check_port(params: PortCheckInput) -> str:
+async def check_port(
+    port: Annotated[
+        int,
+        Field(description="TCP port number to test (e.g. 22, 443, 5432).", ge=1, le=65535),
+    ],
+    host: Annotated[
+        StrippedStr,
+        Field(
+            description="Hostname or IP to check (e.g. '127.0.0.1', 'db.internal').",
+            min_length=1,
+            max_length=253,
+        ),
+    ] = "127.0.0.1",
+    timeout_seconds: Annotated[
+        float, Field(description="Connection timeout in seconds.", ge=0.1, le=30.0)
+    ] = 3.0,
+) -> str:
     """Test whether a TCP port is accepting connections.
 
     Performs a TCP connect to host:port with a timeout. Useful for
@@ -553,22 +533,22 @@ async def check_port(params: PortCheckInput) -> str:
     """
     start = time.monotonic()
     try:
-        with socket.create_connection((params.host, params.port), timeout=params.timeout_seconds):
+        with socket.create_connection((host, port), timeout=timeout_seconds):
             ms = round((time.monotonic() - start) * 1000, 1)
-            return f"Port {params.port} on {params.host} is OPEN (connected in {ms} ms)."
+            return f"Port {port} on {host} is OPEN (connected in {ms} ms)."
     except socket.gaierror:
         return (
-            f"Error: could not resolve host '{params.host}'. "
+            f"Error: could not resolve host '{host}'. "
             "Check the hostname or try an IP address."
         )
     except ConnectionRefusedError:
         return (
-            f"Port {params.port} on {params.host} is CLOSED (connection refused). "
+            f"Port {port} on {host} is CLOSED (connection refused). "
             "The host is reachable but nothing is listening on that port."
         )
     except (socket.timeout, TimeoutError, OSError):
         return (
-            f"Port {params.port} on {params.host} TIMED OUT after {params.timeout_seconds}s. "
+            f"Port {port} on {host} TIMED OUT after {timeout_seconds}s. "
             "The host may be down, unreachable, or a firewall may be dropping packets."
         )
 
@@ -576,17 +556,6 @@ async def check_port(params: PortCheckInput) -> str:
 # ---------------------------------------------------------------------------
 # Uptime / host summary
 # ---------------------------------------------------------------------------
-
-
-class HostInput(BaseModel):
-    """Input for get_host_summary."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
-        description="'markdown' for human-readable output, 'json' for structured data.",
-    )
 
 
 def _host_markdown(d: dict) -> str:
@@ -612,7 +581,11 @@ def _host_markdown(d: dict) -> str:
         openWorldHint=False,
     ),
 )
-async def get_host_summary(params: HostInput) -> str:
+async def get_host_summary(
+    response_format: Annotated[ResponseFormat, Field(description=FORMAT_DESC)] = (
+        ResponseFormat.MARKDOWN
+    ),
+) -> str:
     """One-call health snapshot: hostname, uptime, CPU, RAM, fullest disk.
 
     The right first tool to call when asked "how is this box doing?" —
@@ -651,35 +624,12 @@ async def get_host_summary(params: HostInput) -> str:
         "max_disk_percent": max_disk,
         "assessment": assessment,
     }
-    return _render(payload, params.response_format, _host_markdown)
+    return _render(payload, response_format, _host_markdown)
 
 
 # ---------------------------------------------------------------------------
 # Log tail
 # ---------------------------------------------------------------------------
-
-
-class LogInput(BaseModel):
-    """Input for tail_log."""
-
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-    path: str = Field(
-        ...,
-        description="Absolute path to a log file under an allowed root "
-        f"({', '.join(ALLOWED_LOG_ROOTS)}), e.g. '/var/log/syslog'.",
-        min_length=1,
-        max_length=4096,
-    )
-    lines: int = Field(
-        default=50, description="Number of lines from the end of the file.", ge=1, le=MAX_LOG_LINES
-    )
-    grep: Optional[str] = Field(
-        default=None,
-        description="Case-insensitive substring filter applied before the line limit "
-        "(e.g. 'error', 'oom').",
-        max_length=200,
-    )
 
 
 @mcp.tool(
@@ -692,7 +642,31 @@ class LogInput(BaseModel):
         openWorldHint=False,
     ),
 )
-async def tail_log(params: LogInput) -> str:
+async def tail_log(
+    path: Annotated[
+        StrippedStr,
+        Field(
+            description="Absolute path to a log file under an allowed root "
+            f"({', '.join(ALLOWED_LOG_ROOTS)}), e.g. '/var/log/syslog'.",
+            min_length=1,
+            max_length=4096,
+        ),
+    ],
+    lines: Annotated[
+        int,
+        Field(
+            description="Number of lines from the end of the file.", ge=1, le=MAX_LOG_LINES
+        ),
+    ] = 50,
+    grep: Annotated[
+        Optional[StrippedStr],
+        Field(
+            description="Case-insensitive substring filter applied before the line limit "
+            "(e.g. 'error', 'oom').",
+            max_length=200,
+        ),
+    ] = None,
+) -> str:
     """Read the last N lines of a log file, optionally filtered by substring.
 
     For safety, reads are restricted to allowed log roots (default: /var/log)
@@ -702,10 +676,10 @@ async def tail_log(params: LogInput) -> str:
     Returns:
         str: The matching log lines, or an actionable error message.
     """
-    resolved = Path(params.path).resolve()
+    resolved = Path(path).resolve()
     if not _is_within_allowed_roots(resolved):
         return (
-            f"Error: '{params.path}' resolves outside the allowed log roots "
+            f"Error: '{path}' resolves outside the allowed log roots "
             f"({', '.join(ALLOWED_LOG_ROOTS)}). This tool only reads system logs."
         )
     if not resolved.exists():
@@ -722,17 +696,17 @@ async def tail_log(params: LogInput) -> str:
             "The server may need to run as a user with log read access."
         )
 
-    if params.grep:
-        needle = params.grep.lower()
+    if grep:
+        needle = grep.lower()
         all_lines = [ln for ln in all_lines if needle in ln.lower()]
 
-    tail = all_lines[-params.lines :]
+    tail = all_lines[-lines:]
     if not tail:
-        filt = f" matching '{params.grep}'" if params.grep else ""
+        filt = f" matching '{grep}'" if grep else ""
         return f"No lines{filt} found in {resolved}."
     header = f"Last {len(tail)} line(s) of {resolved}"
-    if params.grep:
-        header += f" matching '{params.grep}'"
+    if grep:
+        header += f" matching '{grep}'"
     return header + ":\n\n" + "".join(tail)
 
 
