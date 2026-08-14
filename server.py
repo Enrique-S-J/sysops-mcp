@@ -41,6 +41,12 @@ BYTES_IN_GB = 1024**3
 ALLOWED_LOG_ROOTS = ("/var/log",)
 MAX_LOG_LINES = 500
 
+# Thresholds at which get_host_summary calls something out in its assessment.
+CPU_SATURATED_PERCENT = 90.0
+MEM_EXHAUSTED_PERCENT = 90.0
+DISK_FULL_PERCENT = 90.0
+SWAP_PRESSURE_PERCENT = 50.0
+
 
 def _is_within_allowed_roots(resolved: Path) -> bool:
     """True if a fully-resolved path sits inside an allowed log root.
@@ -565,7 +571,7 @@ def _host_markdown(d: dict) -> str:
             f"- Hostname: **{d['hostname']}**",
             f"- Booted: {d['boot_time']} (up {d['uptime_hours']} hours)",
             f"- CPU: {d['cpu_percent']}% | RAM: {d['memory_percent']}% | "
-            f"Fullest disk: {d['max_disk_percent']}%",
+            f"Swap: {d['swap_percent']}% | Fullest disk: {d['max_disk_percent']}%",
             f"- Quick read: {d['assessment']}",
         ]
     )
@@ -586,7 +592,7 @@ async def get_host_summary(
         ResponseFormat.MARKDOWN
     ),
 ) -> str:
-    """One-call health snapshot: hostname, uptime, CPU, RAM, fullest disk.
+    """One-call health snapshot: hostname, uptime, CPU, RAM, swap, fullest disk.
 
     The right first tool to call when asked "how is this box doing?" —
     it aggregates the key signals and gives a plain-language assessment,
@@ -594,11 +600,13 @@ async def get_host_summary(
 
     Returns:
         str: Markdown summary or JSON object with keys: hostname, boot_time,
-        uptime_hours, cpu_percent, memory_percent, max_disk_percent, assessment.
+        uptime_hours, cpu_percent, memory_percent, swap_percent,
+        max_disk_percent, assessment.
     """
     boot = psutil.boot_time()
     cpu = psutil.cpu_percent(interval=0.5)
     mem = psutil.virtual_memory().percent
+    swap = psutil.swap_memory()
     max_disk = 0.0
     for part in psutil.disk_partitions(all=False):
         try:
@@ -607,11 +615,17 @@ async def get_host_summary(
             continue
 
     issues = []
-    if cpu >= 90:
+    if cpu >= CPU_SATURATED_PERCENT:
         issues.append("CPU is saturated")
-    if mem >= 90:
+    if mem >= MEM_EXHAUSTED_PERCENT:
         issues.append("memory is nearly exhausted")
-    if max_disk >= 90:
+    elif swap.total > 0 and swap.percent >= SWAP_PRESSURE_PERCENT:
+        # Sustained swapping is a classic cause of "everything feels slow"
+        # even while RAM headroom looks fine, so it is worth surfacing on its
+        # own. Reported only when RAM is not already flagged, since exhausted
+        # memory is the more actionable finding.
+        issues.append("memory is under pressure and the host is swapping")
+    if max_disk >= DISK_FULL_PERCENT:
         issues.append("a disk is nearly full")
     assessment = "; ".join(issues) if issues else "no immediate resource pressure detected"
 
@@ -621,6 +635,7 @@ async def get_host_summary(
         "uptime_hours": round((time.time() - boot) / 3600, 1),
         "cpu_percent": cpu,
         "memory_percent": mem,
+        "swap_percent": swap.percent,
         "max_disk_percent": max_disk,
         "assessment": assessment,
     }

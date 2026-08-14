@@ -6,9 +6,11 @@ See test_protocol.py for coverage of the MCP layer itself.
 """
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
+import server
 from server import (
     ResponseFormat,
     SortBy,
@@ -21,6 +23,20 @@ from server import (
     list_top_processes,
     tail_log,
 )
+
+
+def _vm(percent: float) -> SimpleNamespace:
+    """Minimal stand-in for psutil.virtual_memory()."""
+    total = 16 * 1024**3
+    used = int(total * percent / 100)
+    return SimpleNamespace(
+        total=total, used=used, available=total - used, percent=percent
+    )
+
+
+def _swap(total: int, percent: float) -> SimpleNamespace:
+    """Minimal stand-in for psutil.swap_memory()."""
+    return SimpleNamespace(total=total, used=int(total * percent / 100), percent=percent)
 
 
 @pytest.mark.asyncio
@@ -123,6 +139,51 @@ async def test_host_summary():
     data = json.loads(out)
     assert data["uptime_hours"] >= 0
     assert data["assessment"]
+    assert 0 <= data["swap_percent"] <= 100
+
+
+@pytest.mark.asyncio
+async def test_host_summary_flags_swap_pressure(monkeypatch):
+    """Swapping is reported even when RAM and CPU look healthy."""
+    monkeypatch.setattr(server.psutil, "cpu_percent", lambda interval=None: 5.0)
+    monkeypatch.setattr(
+        server.psutil, "virtual_memory", lambda: _vm(percent=60.0)
+    )
+    monkeypatch.setattr(
+        server.psutil, "swap_memory", lambda: _swap(total=4 * 1024**3, percent=75.0)
+    )
+    data = json.loads(await get_host_summary(response_format=ResponseFormat.JSON))
+    assert "swapping" in data["assessment"]
+    assert data["swap_percent"] == 75.0
+
+
+@pytest.mark.asyncio
+async def test_host_summary_prefers_exhaustion_over_swapping(monkeypatch):
+    """Exhausted RAM is the more actionable finding, so it wins."""
+    monkeypatch.setattr(server.psutil, "cpu_percent", lambda interval=None: 5.0)
+    monkeypatch.setattr(
+        server.psutil, "virtual_memory", lambda: _vm(percent=97.0)
+    )
+    monkeypatch.setattr(
+        server.psutil, "swap_memory", lambda: _swap(total=4 * 1024**3, percent=99.0)
+    )
+    data = json.loads(await get_host_summary(response_format=ResponseFormat.JSON))
+    assert "nearly exhausted" in data["assessment"]
+    assert "swapping" not in data["assessment"]
+
+
+@pytest.mark.asyncio
+async def test_host_summary_ignores_swap_on_swapless_hosts(monkeypatch):
+    """A host with swap disabled reports 0/0 and must not be flagged."""
+    monkeypatch.setattr(server.psutil, "cpu_percent", lambda interval=None: 5.0)
+    monkeypatch.setattr(
+        server.psutil, "virtual_memory", lambda: _vm(percent=40.0)
+    )
+    monkeypatch.setattr(
+        server.psutil, "swap_memory", lambda: _swap(total=0, percent=0.0)
+    )
+    data = json.loads(await get_host_summary(response_format=ResponseFormat.JSON))
+    assert data["assessment"] == "no immediate resource pressure detected"
 
 
 @pytest.mark.asyncio
